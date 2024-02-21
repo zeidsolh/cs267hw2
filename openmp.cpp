@@ -79,7 +79,7 @@ void simulate_one_step(particle_t* parts, int num_parts, double size) {
         grid[cell_y * grid_size + cell_x].particles.push_back(i);
         omp_unset_lock(&cell_locks[cell_y * grid_size + cell_x]);
     }
-
+#pragma omp barrier
 #pragma omp for
     for (int cell_id = tid; cell_id < grid.size(); cell_id += max_tid) { // Loop over every cell
         int cell_row = cell_id / grid_size;
@@ -111,6 +111,7 @@ void simulate_one_step(particle_t* parts, int num_parts, double size) {
     }
 
 // Move particles
+#pragma omp barrier
 #pragma omp for
     for (int i = tid; i < num_parts; i += max_tid) {
         move(parts[i], size);
