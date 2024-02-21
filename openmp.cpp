@@ -14,25 +14,34 @@ std::vector<Cell> grid; // Grid of cells
 int grid_size;          // Number of cells along one side of the grid
 int grid_size_sq;       // grid_size * grid_size
 omp_lock_t* cell_locks; // Locks for each cell in the grid
+std::vector<std::pair<int, int>> changes = {
+    {-1, 0}, {-1, -1}, {0, -1}, {1, -1}, {0, 0}}; // Changes in row and column
 
 // Apply the force from neighbor to particle
 void apply_force(particle_t& particle, particle_t& neighbor) {
-    // Calculate Distance
     double dx = neighbor.x - particle.x;
     double dy = neighbor.y - particle.y;
     double r2 = dx * dx + dy * dy;
 
-    // Check if the two particles should interact
     if (r2 > cutoff * cutoff)
         return;
 
     r2 = fmax(r2, min_r * min_r);
     double r = sqrt(r2);
-
-    // Very simple short-range repulsive force
     double coef = (1 - cutoff / r) / r2 / mass;
-    particle.ax += coef * dx;
-    particle.ay += coef * dy;
+
+    double dx_coef = coef * dx;
+    double dy_coef = coef * dy;
+
+// Use atomic operations for thread-safe updates
+#pragma omp atomic
+    particle.ax += dx_coef;
+#pragma omp atomic
+    particle.ay += dy_coef;
+#pragma omp atomic
+    neighbor.ax -= dx_coef; // Apply equal and opposite force
+#pragma omp atomic
+    neighbor.ay -= dy_coef;
 }
 
 // Integrate the ODE
@@ -67,11 +76,14 @@ void init_simulation(particle_t* parts, int num_parts, double size) {
 }
 
 void simulate_one_step(particle_t* parts, int num_parts, double size) {
-    int tid = omp_get_thread_num();
-    int max_tid = omp_get_num_threads();
+
 #pragma omp for
-    for (int i = tid; i < num_parts;
-         i += max_tid) { // Assign each particle to a cell based on its position
+    for (int i = 0; i < grid_size_sq; i += 1) {
+        grid[i].particles.clear();
+    }
+
+#pragma omp for
+    for (int i = 0; i < num_parts; i += 1) { // Assign each particle to a cell based on its position
         int cell_x = parts[i].x / (size / grid_size);
         int cell_y = parts[i].y / (size / grid_size);
 
@@ -79,31 +91,32 @@ void simulate_one_step(particle_t* parts, int num_parts, double size) {
         grid[cell_y * grid_size + cell_x].particles.push_back(i);
         omp_unset_lock(&cell_locks[cell_y * grid_size + cell_x]);
     }
-#pragma omp barrier
+
 #pragma omp for
-    for (int cell_id = tid; cell_id < grid.size(); cell_id += max_tid) { // Loop over every cell
+    for (int i = 0; i < num_parts; i++) {
+        parts[i].ax = 0;
+        parts[i].ay = 0;
+    }
+
+#pragma omp for
+    for (int cell_id = 0; cell_id < grid.size(); cell_id += 1) {
         int cell_row = cell_id / grid_size;
         int cell_col = cell_id % grid_size;
 
-        for (int p_id : grid[cell_id].particles) { // Loop over every particle in that cell
-            parts[p_id].ax = parts[p_id].ay = 0;
+        for (int p_id : grid[cell_id].particles) {
 
-            for (int row_change = -1; row_change <= 1;
-                 ++row_change) { // Iterate over all 8 neighboring cells and current cell
-                for (int col_change = -1; col_change <= 1; ++col_change) {
-                    int neighbor_row = cell_row + row_change;
-                    int neighbor_col = cell_col + col_change;
+            for (auto change : changes) {
+                int neighbor_row = cell_row + change.first;
+                int neighbor_col = cell_col + change.second;
 
-                    if (neighbor_row >= 0 && neighbor_row < grid_size && neighbor_col >= 0 &&
-                        neighbor_col < grid_size) { // Make sure within grid bounds (border case)
-                        int neighbor_cell_id = neighbor_row * grid_size + neighbor_col;
+                if (neighbor_row >= 0 && neighbor_row < grid_size && neighbor_col >= 0 &&
+                    neighbor_col < grid_size) {
+                    int neighbor_cell_id = neighbor_row * grid_size + neighbor_col;
 
-                        for (int neighbor_p_id :
-                             grid[neighbor_cell_id]
-                                 .particles) { // Loop over all particles in current cell and
-                                               // neighboring cells
-                            apply_force(parts[p_id], parts[neighbor_p_id]); // Compute forces
-                        }
+                    for (int neighbor_p_id : grid[neighbor_cell_id].particles) {
+                        if ((cell_id != neighbor_cell_id) ||
+                            (p_id < neighbor_p_id)) // Avoid double counting
+                            apply_force(parts[p_id], parts[neighbor_p_id]);
                     }
                 }
             }
@@ -111,9 +124,8 @@ void simulate_one_step(particle_t* parts, int num_parts, double size) {
     }
 
 // Move particles
-#pragma omp barrier
 #pragma omp for
-    for (int i = tid; i < num_parts; i += max_tid) {
+    for (int i = 0; i < num_parts; i += 1) {
         move(parts[i], size);
     }
 }
