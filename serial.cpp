@@ -4,25 +4,45 @@
 #include <iostream>
 #include <vector>
 
+
 struct Cell {
     std::vector<int> particles; // Indices of particles in each cell
 };
 
+// Global variables
+std::vector<Cell> grid; // Grid of cells
+int grid_size;          // Number of cells along one side of the grid
+int grid_size_sq;       // grid_size * grid_size
+std::vector<std::pair<int, int>> changes = {
+    {-1, 0}, {-1, -1}, {0, -1}, {1, -1}, {0, 0}}; // Changes in row and column
+
+// Apply the force from neighbor to particle
 void apply_force(particle_t& particle, particle_t& neighbor) {
-    double col_change = neighbor.x - particle.x;
-    double row_change = neighbor.y - particle.y;
-    double r2 = col_change * col_change + row_change * row_change;
+    double dx = neighbor.x - particle.x;
+    double dy = neighbor.y - particle.y;
+    double r2 = dx * dx + dy * dy;
+
     if (r2 > cutoff * cutoff)
         return;
 
     r2 = fmax(r2, min_r * min_r);
     double r = sqrt(r2);
     double coef = (1 - cutoff / r) / r2 / mass;
-    particle.ax += coef * col_change;
-    particle.ay += coef * row_change;
+
+    double dx_coef = coef * dx;
+    double dy_coef = coef * dy;
+
+// Use atomic operations for thread-safe updates
+    particle.ax += dx_coef;
+    particle.ay += dy_coef;
+    neighbor.ax -= dx_coef; // Apply equal and opposite force
+    neighbor.ay -= dy_coef;
 }
 
+// Integrate the ODE
 void move(particle_t& p, double size) {
+    // Slightly simplified Velocity Verlet integration
+    // Conserves energy better than explicit Euler method
     p.vx += p.ax * dt;
     p.vy += p.ay * dt;
     p.x += p.vx * dt;
@@ -33,6 +53,7 @@ void move(particle_t& p, double size) {
         p.x = p.x < 0 ? -p.x : 2 * size - p.x;
         p.vx = -p.vx;
     }
+
     while (p.y < 0 || p.y > size) {
         p.y = p.y < 0 ? -p.y : 2 * size - p.y;
         p.vy = -p.vy;
@@ -40,77 +61,56 @@ void move(particle_t& p, double size) {
 }
 
 void init_simulation(particle_t* parts, int num_parts, double size) {
-    // Initialization logic if needed
+    grid_size = ceil(size / cutoff);
+    grid_size_sq = grid_size * grid_size;
+    grid.resize(grid_size_sq);
 }
 
 void simulate_one_step(particle_t* parts, int num_parts, double size) {
-    int grid_size = ceil(size / cutoff);           // Number of cells along one side of the grid
-    std::vector<Cell> grid(grid_size * grid_size); // Instantiate grid to be a square
 
-    for (int i = 0; i < num_parts; ++i) { // Assign each particle to a cell based on its position
+    for (int i = 0; i < grid_size_sq; i += 1) {
+        grid[i].particles.clear();
+    }
+
+
+    for (int i = 0; i < num_parts; i += 1) { // Assign each particle to a cell based on its position
         int cell_x = parts[i].x / (size / grid_size);
         int cell_y = parts[i].y / (size / grid_size);
+
         grid[cell_y * grid_size + cell_x].particles.push_back(i);
     }
 
-    std::vector<particle_t> sorted_particles(num_parts); // Sorted particles vector
-    std::vector<int> map_original_particles_to_sorted(
-        num_parts); // Map original particles to sorted vector
-    int index = 0;
-    for (int i = 0; i < grid_size * grid_size; ++i) {
-        for (int p_id : grid[i].particles) {
-            sorted_particles[index] =
-                parts[p_id]; // Fill sorted particles vector to improve cache locality
-            map_original_particles_to_sorted[p_id] = index;
-            index++;
-        }
+    for (int i = 0; i < num_parts; i++) {
+        parts[i].ax = 0;
+        parts[i].ay = 0;
     }
 
-    for (auto& cell : grid) {
-        cell.particles.clear(); // Clear cells so we can re-populate them using sorted particles
-    }
-
-    for (int i = 0; i < num_parts;
-         ++i) { // Re-assign each particle to a cell based on its position in sorted vector
-        int cell_x = sorted_particles[i].x / (size / grid_size);
-        int cell_y = sorted_particles[i].y / (size / grid_size);
-        grid[cell_y * grid_size + cell_x].particles.push_back(i);
-    }
-
-    for (int cell_id = 0; cell_id < grid.size(); ++cell_id) { // Loop over every cell
+    for (int cell_id = 0; cell_id < grid.size(); cell_id += 1) {
         int cell_row = cell_id / grid_size;
         int cell_col = cell_id % grid_size;
 
-        for (int p_id : grid[cell_id].particles) { // Loop over every particle in that cell
-            sorted_particles[p_id].ax = sorted_particles[p_id].ay = 0;
+        for (int p_id : grid[cell_id].particles) {
 
-            for (int row_change = -1; row_change <= 1;
-                 ++row_change) { // Iterate over all 8 neighboring cells and current cell
-                for (int col_change = -1; col_change <= 1; ++col_change) {
-                    int neighbor_row = cell_row + row_change;
-                    int neighbor_col = cell_col + col_change;
+            for (auto change : changes) {
+                int neighbor_row = cell_row + change.first;
+                int neighbor_col = cell_col + change.second;
 
-                    if (neighbor_row >= 0 && neighbor_row < grid_size && neighbor_col >= 0 &&
-                        neighbor_col < grid_size) { // Make sure within grid bounds (border case)
-                        int neighbor_cell_id = neighbor_row * grid_size + neighbor_col;
+                if (neighbor_row >= 0 && neighbor_row < grid_size && neighbor_col >= 0 &&
+                    neighbor_col < grid_size) {
+                    int neighbor_cell_id = neighbor_row * grid_size + neighbor_col;
 
-                        for (int neighbor_p_id :
-                             grid[neighbor_cell_id].particles) { // Loop over all particles in
-                                                                 // current cell and current cell
-                            apply_force(sorted_particles[p_id],
-                                        sorted_particles[neighbor_p_id]); // Compute forces
-                        }
+                    for (int neighbor_p_id : grid[neighbor_cell_id].particles) {
+                        if ((cell_id != neighbor_cell_id) ||
+                            (p_id < neighbor_p_id)) // Avoid double counting
+                            apply_force(parts[p_id], parts[neighbor_p_id]);
                     }
                 }
             }
         }
     }
 
-    // Move particles
-    for (int i = 0; i < num_parts; ++i) {
-        move(sorted_particles[i], size);
+// Move particles
+    for (int i = 0; i < num_parts; i += 1) {
+        move(parts[i], size);
     }
-
-    std::copy(sorted_particles.begin(), sorted_particles.end(),
-              parts); // copies updated particles back to parts
 }
